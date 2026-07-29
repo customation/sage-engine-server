@@ -122,9 +122,19 @@ jobs:
       - name: Package and digest
         run: |
           ARCHIVE="$ENGINE_ID-${{ matrix.platform }}.zip"
-          # 7z is on both runner images and writes a plain deflate zip, which is
-          # what the client's extractor reads.
-          (cd "stage/$ENGINE_ID" && 7z a -tzip -mx=5 "../../$ARCHIVE" . > /dev/null)
+          # A plain deflate zip, which is what the client's extractor reads.
+          # Whichever of the two standard tools the runner image has — and a loud
+          # failure if neither, rather than an archive that silently is not one.
+          cd "stage/$ENGINE_ID"
+          if command -v 7z > /dev/null 2>&1; then
+            7z a -tzip -mx=5 "../../$ARCHIVE" . > /dev/null
+          elif command -v zip > /dev/null 2>&1; then
+            zip -r -9 -q "../../$ARCHIVE" .
+          else
+            echo "::error::this runner has neither 7z nor zip"
+            exit 1
+          fi
+          cd ../..
           SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
           SIZE=$(wc -c < "$ARCHIVE" | tr -d ' ')
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
