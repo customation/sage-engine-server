@@ -1,0 +1,181 @@
+name: Publish engine release
+
+# Builds Open Sage as a downloadable engine release and publishes it where
+# GammonBase Desktop looks for it: gammonbase.com/engines/catalogue.json, which
+# the site COMPOSES from the objects this workflow uploads. Nothing rewrites a
+# shared catalogue file, so two engines releasing at the same moment cannot race.
+#
+# What lands in the assets bucket, per platform:
+#   engines/sage/identity.json                                  who this engine is
+#   engines/sage/<version>/<platform>/release.json              how to install and run it
+#   engines/sage/<version>/<platform>/sage-<platform>.zip       the engine itself
+#
+# REQUIREMENTS before this can run green:
+#   * customation/backgammon-engine-protocol must exist — Cargo.toml depends on
+#     it by git URL, and cargo cannot fetch a repository that is not there.
+#   * Two GitHub secrets, the same pair the gammonbase site's release workflow
+#     uses: SCW_OBJECT_STORAGE_ACCESS_KEY / SCW_OBJECT_STORAGE_SECRET_KEY
+#     (a Scaleway IAM key with ObjectStorage write on the project).
+# customation/bgsage is public, so the engine core needs no token.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (semantic, e.g. 0.3.1)'
+        required: true
+  push:
+    tags:
+      - 'v*'
+
+env:
+  # The id the catalogue and every installed copy know this engine by. Changing
+  # it would orphan every install, so it is fixed here and nowhere else.
+  ENGINE_ID: sage
+  # Must match the site's ObjectStorage config and DownloadsController's bucket.
+  S3_ENDPOINT: https://s3.fr-par.scw.cloud
+  S3_BUCKET: gammonbase-assets-prod
+  # EngineCatalogueService composes the catalogue from exactly this prefix.
+  ENGINES_PREFIX: engines
+
+jobs:
+  publish:
+    strategy:
+      # One job per published platform, and NOT fail-fast: a broken Linux build
+      # should not withdraw a working Windows release.
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows-x86_64
+            exe: sage-engine-server.exe
+            capi: bgsage_capi.dll
+            capi_built: build/Release/bgsage_capi.dll
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            exe: sage-engine-server
+            capi: libbgsage_capi.so
+            capi_built: build/libbgsage_capi.so
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        # Git Bash on the Windows runner, so one script serves both platforms.
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The engine core: the C API shim, the weights and the bearoff database.
+      # Public repository, so no token.
+      - name: Check out the engine core
+        uses: actions/checkout@v4
+        with:
+          repository: customation/bgsage
+          path: bgsage
+
+      - name: Resolve the version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          # The desktop app orders releases by SEMANTIC version — "0.10.0" is
+          # newer than "0.9.0", which text ordering gets backwards — and reports
+          # a version it cannot parse instead of guessing. Refuse it here, where
+          # it is one line to fix, rather than in everyone's Settings screen.
+          if ! printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$VERSION' is not a semantic version"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Publishing $ENGINE_ID $VERSION for ${{ matrix.platform }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # CPU-only, self-contained CMake project (bgsage/cpp/capi) — no CUDA, no
+      # pybind11. The default generator is used on purpose: Ninja would need the
+      # MSVC developer environment set up first.
+      - name: Build the engine core
+        run: |
+          cmake -S bgsage/cpp/capi -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          test -f "${{ matrix.capi_built }}" || { echo "::error::${{ matrix.capi_built }} was not produced"; exit 1; }
+
+      - name: Build the daemon
+        run: cargo build --release
+
+      # The layout the daemon resolves by default, RELATIVE TO ITS OWN
+      # EXECUTABLE (see build_pool in src/main.rs) — so the release needs no
+      # arguments at all, and the app spawns it with none.
+      - name: Assemble the release
+        run: |
+          STAGE="stage/$ENGINE_ID"
+          mkdir -p "$STAGE/models" "$STAGE/data"
+          cp "target/release/${{ matrix.exe }}" "$STAGE/"
+          cp "${{ matrix.capi_built }}" "$STAGE/${{ matrix.capi }}"
+          # The stage9 model set the daemon serves; nothing else from models/.
+          cp bgsage/models/sl_s9_*.weights.best "$STAGE/models/"
+          cp bgsage/data/bearoff_1sided.db "$STAGE/data/"
+          echo "Staged:"; find "$STAGE" -type f | wc -l; du -sh "$STAGE"
+
+      - name: Package and digest
+        run: |
+          ARCHIVE="$ENGINE_ID-${{ matrix.platform }}.zip"
+          # 7z is on both runner images and writes a plain deflate zip, which is
+          # what the client's extractor reads.
+          (cd "stage/$ENGINE_ID" && 7z a -tzip -mx=5 "../../$ARCHIVE" . > /dev/null)
+          SHA=$(sha256sum "$ARCHIVE" | cut -d' ' -f1)
+          SIZE=$(wc -c < "$ARCHIVE" | tr -d ' ')
+          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+          echo "SHA256=$SHA" >> "$GITHUB_ENV"
+          echo "SIZE=$SIZE" >> "$GITHUB_ENV"
+          echo "$ARCHIVE  $SHA  $SIZE bytes"
+
+      # The two documents the site composes the catalogue from. The digest is
+      # what lets an install be REFUSED; the command is what stops the client
+      # guessing a path into the archive.
+      - name: Write the manifests
+        run: |
+          cat > identity.json <<JSON
+          {
+            "id": "$ENGINE_ID",
+            "name": "Open Sage",
+            "description": "GammonBase's house engine. Nineteen neural networks with a backgame-aware pair strategy, plus a one-sided bearoff database.",
+            "licence": "AGPL-3.0-or-later",
+            "sourceUrl": "https://github.com/customation/bgsage"
+          }
+          JSON
+          cat > release.json <<JSON
+          {
+            "version": "$VERSION",
+            "platform": "${{ matrix.platform }}",
+            "file": "$ARCHIVE",
+            "sha256": "$SHA256",
+            "sizeBytes": $SIZE,
+            "command": "${{ matrix.exe }}",
+            "args": [],
+            "instances": 2
+          }
+          JSON
+          cat identity.json release.json
+
+      # The archive FIRST, then the manifest that publishes it: the catalogue is
+      # composed from the manifests, so a release becomes visible only once the
+      # thing it describes is actually downloadable.
+      - name: Publish to object storage
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
+          AWS_DEFAULT_REGION: fr-par
+        run: |
+          if [ -z "$AWS_ACCESS_KEY_ID" ]; then
+            echo "::error::SCW_OBJECT_STORAGE_ACCESS_KEY / _SECRET_KEY are not set on this repository."
+            exit 1
+          fi
+          BASE="s3://$S3_BUCKET/$ENGINES_PREFIX/$ENGINE_ID"
+          RELEASE="$BASE/$VERSION/${{ matrix.platform }}"
+          aws s3 cp "$ARCHIVE" "$RELEASE/$ARCHIVE" --endpoint-url "$S3_ENDPOINT" --content-type application/zip
+          aws s3 cp release.json "$RELEASE/release.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
+          aws s3 cp identity.json "$BASE/identity.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
+          echo "Published $ENGINE_ID $VERSION (${{ matrix.platform }})"
