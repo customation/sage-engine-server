@@ -67,10 +67,16 @@ jobs:
 
       # The engine core: the C API shim, the weights and the bearoff database.
       # Public repository, so no token.
+      #
+      # The `gbase` branch, NOT the default one: `cpp/capi` — the standalone
+      # CPU-only build of the C API this daemon loads — exists only there. A
+      # checkout of `main` produces a tree with no capi to build, which is
+      # exactly how the first run of this workflow failed.
       - name: Check out the engine core
         uses: actions/checkout@v4
         with:
           repository: customation/bgsage
+          ref: gbase
           path: bgsage
 
       - name: Resolve the version
