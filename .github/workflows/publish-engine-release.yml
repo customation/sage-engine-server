@@ -56,6 +56,19 @@ jobs:
             exe: sage-engine-server
             capi: libbgsage_capi.so
             capi_built: build/libbgsage_capi.so
+          # ARM64. Nothing in bgsage needed changing for this: neural_net.cpp
+          # already selects a NEON path from __aarch64__, and cpp/capi's CMake
+          # already withholds -mavx2/-mfma on arm64. This entry is what proves it
+          # — the same source, the same NEON code an Apple Silicon build will
+          # take, compiled and smoke-tested on hardware GitHub gives us for free.
+          # If it goes green, macos-aarch64 is a runner label away once the Apple
+          # account exists; if it does not, we learn that now rather than while
+          # waiting on Apple.
+          - os: ubuntu-24.04-arm
+            platform: linux-aarch64
+            exe: sage-engine-server
+            capi: libbgsage_capi.so
+            capi_built: build/libbgsage_capi.so
     runs-on: ${{ matrix.os }}
     defaults:
       run:
