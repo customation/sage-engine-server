@@ -279,6 +279,12 @@ jobs:
       # objects never touched.
       - name: Remove superseded builds for this platform
         env:
+          # `--delimiter /` is a bare slash, and Git Bash on windows-latest
+          # rewrites that to C:/Program Files/Git/ before aws ever sees it -- so
+          # the listing matched nothing, the loop never ran, and the Windows
+          # prune silently did nothing while both Linux jobs pruned correctly.
+          # Ignored on Linux, where the variable means nothing.
+          MSYS_NO_PATHCONV: 1
           AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
           AWS_DEFAULT_REGION: fr-par
