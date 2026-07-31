@@ -1,0 +1,153 @@
+name: Diagnose the arm64 evaluation divergence
+
+# Why one number differs on Apple Silicon.
+#
+# verify-macos-build.yml found that macos-aarch64 evaluates the starting
+# position to WinProb 0.5272137 where every other platform -- windows-x86_64,
+# linux-x86_64, linux-aarch64 and macos-x86_64 -- produces 0.5276. The e2e
+# tolerance is 5e-5 and the miss is 3.9e-4, so this is not rounding noise.
+#
+# What that already rules out:
+#   * "clang differs from gcc"      -- macos-x86_64 is clang and agrees.
+#   * "NEON differs from AVX2"      -- linux-aarch64 is NEON and agrees.
+# What is left is the intersection: clang compiling the NEON path. The two
+# standing candidates are the reassociation -funsafe-math-optimizations permits
+# around fast_sigmoid's interpolation, and Apple's libm exp differing from
+# glibc's where the sigmoid lookup table is built (neural_net.cpp line 42).
+#
+# Rather than bisect over four pushes, this builds every variant in one run and
+# prints what each produces. It patches the CMakeLists in the RUNNER'S checkout
+# of bgsage only -- nothing is committed, and customation/bgsage is untouched.
+#
+# Delete this workflow once the cause is known and fixed.
+#
+# NOTE ON THE FIX, so it is not quietly reinterpreted later: the answer is to
+# make Apple Silicon agree, not to widen the tolerance. These numbers become PR,
+# ER and blunder classification, and two players comparing error rates must not
+# get different answers because one of them is on an M1.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  measure:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The architecture under suspicion.
+          - os: macos-latest
+            label: macos-aarch64
+          # Control. Same NEON source, same variants, gcc instead of clang.
+          # If a variant fixes macOS but changes this, the "fix" is really two
+          # wrongs cancelling and should be rejected.
+          - os: ubuntu-24.04-arm
+            label: linux-aarch64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the engine core
+        uses: actions/checkout@v4
+        with:
+          repository: customation/bgsage
+          ref: gbase
+          path: bgsage
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Built once. The daemon does not change between variants -- only the C++
+      # underneath it does -- so rebuilding it four times would measure nothing
+      # and cost four times the runner minutes.
+      - name: Build the daemon
+        run: cargo build --release
+
+      - name: Stage the weights and bearoff database
+        run: |
+          mkdir -p stage/models stage/data
+          cp target/release/sage-engine-server stage/
+          cp bgsage/models/sl_s9_*.weights.best stage/models/
+          cp bgsage/data/bearoff_1sided.db stage/data/
+
+      - name: Measure every flag variant
+        run: |
+          set -uo pipefail
+
+          CMAKELISTS=bgsage/cpp/capi/CMakeLists.txt
+          cp "$CMAKELISTS" /tmp/CMakeLists.pristine
+
+          case "${{ matrix.label }}" in
+            macos-aarch64) LIBNAME=libbgsage_capi.dylib ;;
+            *)             LIBNAME=libbgsage_capi.so ;;
+          esac
+
+          # name|flags. The first is what ships today, so its number is the one
+          # that must be reproduced before any variant can be believed.
+          VARIANTS=(
+            "baseline|-O3 -funsafe-math-optimizations -fno-math-errno -funroll-loops"
+            "no-fp-contract|-O3 -funsafe-math-optimizations -fno-math-errno -funroll-loops -ffp-contract=off"
+            "no-unsafe-math|-O3 -fno-math-errno -funroll-loops"
+            "plain-O3|-O3"
+          )
+
+          RESULTS=()
+          for entry in "${VARIANTS[@]}"; do
+            NAME="${entry%%|*}"
+            FLAGS="${entry#*|}"
+            echo "::group::$NAME  ($FLAGS)"
+
+            cp /tmp/CMakeLists.pristine "$CMAKELISTS"
+            # Replace the arm64 branch's flag list. A sed that matches nothing
+            # would silently measure the baseline four times and produce a
+            # beautifully consistent table of lies, so the substitution is
+            # verified before anything is compiled.
+            sed -i.bak "s|set(BGBOT_OPT_FLAGS -O3 -funsafe-math-optimizations.*)|set(BGBOT_OPT_FLAGS $FLAGS)|" "$CMAKELISTS"
+            if ! grep -qF "set(BGBOT_OPT_FLAGS $FLAGS)" "$CMAKELISTS"; then
+              echo "::error::could not patch $CMAKELISTS for variant '$NAME' -- the arm64 flag line has changed shape"
+              exit 1
+            fi
+
+            rm -rf build
+            cmake -S bgsage/cpp/capi -B build -DCMAKE_BUILD_TYPE=Release > /dev/null
+            cmake --build build --config Release > /dev/null 2>&1
+            cp "build/$LIBNAME" "stage/$LIBNAME"
+
+            # The e2e exits non-zero on a parity miss, which is the point -- but
+            # here its NUMBER is the measurement, so the exit code is recorded
+            # rather than obeyed. Nothing is being swallowed: both the status
+            # and the value go into the table below.
+            OUT="$(python3 tests/e2e/run_e2e.py \
+                    "stage/sage-engine-server" \
+                    "stage/$LIBNAME" \
+                    "stage/models" \
+                    "stage/data/bearoff_1sided.db" 2>&1)"
+            STATUS=$?
+            echo "$OUT"
+            echo "::endgroup::"
+
+            # "FAIL evaluatePosition 1ply parity: WinProb: got 0.5272136926651001, wanted 0.5276"
+            GOT="$(printf '%s' "$OUT" | sed -n 's/.*WinProb: got \([0-9.]*\).*/\1/p' | head -1)"
+            if [ -z "$GOT" ] && [ "$STATUS" -eq 0 ]; then GOT="0.5276 (matched)"; fi
+            [ -n "$GOT" ] || GOT="no number reported"
+
+            if [ "$STATUS" -eq 0 ]; then VERDICT=PASS; else VERDICT=FAIL; fi
+            RESULTS+=("$NAME|$VERDICT|$GOT")
+          done
+
+          cp /tmp/CMakeLists.pristine "$CMAKELISTS"
+
+          {
+            echo "### ${{ matrix.label }}"
+            echo
+            echo "Reference WinProb for the starting position: **0.5276**"
+            echo
+            echo "| variant | verdict | WinProb |"
+            echo "|---|---|---|"
+            for r in "${RESULTS[@]}"; do
+              printf '| `%s` | %s | %s |\n' "${r%%|*}" "$(printf '%s' "$r" | cut -d'|' -f2)" "${r##*|}"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
