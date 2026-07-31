@@ -168,28 +168,6 @@ jobs:
           cp bgsage/data/bearoff_1sided.db "$STAGE/data/"
           echo "Staged:"; find "$STAGE" -type f | wc -l; du -sh "$STAGE"
 
-      # The gate. Before this existed, every job in this workflow could go green
-      # while shipping an engine that evaluated positions wrongly -- and one did:
-      # the linux-aarch64 build published on 2026-07-30 returned WinProb
-      # 0.5272137 for the starting position where every x86 build returned
-      # 0.5276, because ARM had no vectorized sigmoid and fell back to a lookup
-      # table for the whole hidden layer. Nothing here could have noticed. The
-      # workflow compiled the code, checked a file existed, zipped it and
-      # uploaded it.
-      #
-      # Run against the STAGED tree, not the build tree, because the staged tree
-      # is what users get: it proves the layout, the library beside the binary
-      # and the weights all work together, not merely that a compiler succeeded.
-      #
-      # The e2e asserts numbers -- start position win=0.5276, eq=+0.0819,
-      # cf=+0.1045, best 3-1 = 8/5 6/5 at +0.2148, to four decimals -- so a
-      # platform computing something subtly different fails here rather than in
-      # somebody's match analysis.
-      #
-      # Python is preinstalled on all three runner images and is a CI referee
-      # only; nothing a user installs requires it. Which name it answers to
-      # differs, hence the probe: Git Bash on windows-latest has `python` but
-      # not always `python3`.
       # macOS only. Signing happens BEFORE the e2e below, so what gets exercised
       # is the artefact that ships, Hardened Runtime and all — not an unsigned
       # near-copy of it.
@@ -263,6 +241,28 @@ jobs:
             codesign --display --verbose=2 "$file" 2>&1 | grep -E "Authority|Timestamp|flags" || true
           done
 
+      # The gate. Before this existed, every job in this workflow could go green
+      # while shipping an engine that evaluated positions wrongly -- and one did:
+      # the linux-aarch64 build published on 2026-07-30 returned WinProb
+      # 0.5272137 for the starting position where every x86 build returned
+      # 0.5276, because ARM had no vectorized sigmoid and fell back to a lookup
+      # table for the whole hidden layer. Nothing here could have noticed. The
+      # workflow compiled the code, checked a file existed, zipped it and
+      # uploaded it.
+      #
+      # Run against the STAGED tree, not the build tree, because the staged tree
+      # is what users get: it proves the layout, the library beside the binary
+      # and the weights all work together, not merely that a compiler succeeded.
+      #
+      # The e2e asserts numbers -- start position win=0.5276, eq=+0.0819,
+      # cf=+0.1045, best 3-1 = 8/5 6/5 at +0.2148, to four decimals -- so a
+      # platform computing something subtly different fails here rather than in
+      # somebody's match analysis.
+      #
+      # Python is preinstalled on all three runner images and is a CI referee
+      # only; nothing a user installs requires it. Which name it answers to
+      # differs, hence the probe: Git Bash on windows-latest has `python` but
+      # not always `python3`.
       - name: Prove the staged release evaluates correctly
         run: |
           PY=python3
