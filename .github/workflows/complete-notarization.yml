@@ -1,0 +1,173 @@
+name: Complete notarization
+
+# Publishes macOS builds that were submitted to Apple and left waiting.
+#
+# publish-engine-release.yml does not wait for the notary service, because that
+# queue cannot be waited out: gnubg's archives came back in 22 minutes, sage's
+# ran past 80 on the same account and the same day, and Apple documents 24-72
+# hours for anything that trips extended review. A release job that blocks on
+# that is a release that can be lost to it — notarytool exits, the runner is
+# destroyed, Apple accepts an hour later, and the artefact is gone.
+#
+# So the release job submits, stages the archive under staging/engines/ with the
+# submission id beside it, and stops. This asks Apple what happened and promotes
+# whatever is ready.
+#
+# Nothing here rebuilds, re-signs or re-digests anything. The archive promoted is
+# byte-for-byte the one that was signed, proved against the e2e and submitted —
+# which is also why this is safe to run repeatedly: a submission that is still in
+# progress is simply left alone.
+#
+# Runs on macOS because notarytool is macOS-only. The repository is public, so
+# the runner minutes are free.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Hourly. Fast enough that a normal submission is published within the hour,
+    # slow enough that a 72-hour review does not cost 144 runs. Does nothing at
+    # all when there is nothing staged.
+    - cron: '17 * * * *'
+
+env:
+  ENGINE_ID: sage
+  S3_ENDPOINT: https://s3.fr-par.scw.cloud
+  S3_BUCKET: gammonbase-assets-prod
+  ENGINES_PREFIX: engines
+  STAGING_PREFIX: staging/engines
+
+jobs:
+  promote:
+    runs-on: macos-latest
+    environment: release
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Promote everything Apple has accepted
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
+          AWS_DEFAULT_REGION: fr-par
+        run: |
+          set -u
+
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+          trap 'rm -f "$KEY"' EXIT
+
+          BASE="$ENGINES_PREFIX/$ENGINE_ID"
+          STAGE_BASE="$STAGING_PREFIX/$ENGINE_ID"
+
+          # Every staged submission, found by its pending.json.
+          PENDING="$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+            --prefix "$STAGE_BASE/" \
+            --endpoint-url "$S3_ENDPOINT" --query 'Contents[].Key' --output text \
+            | tr '\t' '\n' | tr -d '\r' | grep '/pending.json$' || true)"
+
+          if [ -z "$PENDING" ]; then
+            echo "Nothing staged for $ENGINE_ID."
+            echo "### $ENGINE_ID: nothing awaiting notarization" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          PROMOTED=0
+          WAITING=0
+          REJECTED=0
+
+          for key in $PENDING; do
+            echo "::group::$key"
+            aws s3 cp "s3://$S3_BUCKET/$key" pending.json --endpoint-url "$S3_ENDPOINT" > /dev/null
+
+            ID="$(jq -r .submissionId pending.json)"
+            VERSION="$(jq -r .version pending.json)"
+            PLATFORM="$(jq -r .platform pending.json)"
+            ARCHIVE="$(jq -r .file pending.json)"
+
+            # notarytool info answers for a submission the tool never waited on:
+            # the id outlives the job that created it.
+            INFO="$RUNNER_TEMP/info-$ID.txt"
+            set +e
+            xcrun notarytool info "$ID" \
+              --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" 2>&1 | tee "$INFO"
+            set -e
+            STATUS="$(grep -Eo '  status: [A-Za-z ]+' "$INFO" | tail -1 | sed 's/  status: //' | xargs || true)"
+            echo "status: ${STATUS:-unknown}"
+
+            if [ "$STATUS" != "Accepted" ]; then
+              if [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
+                # It will never become publishable. Say so and clear it, rather
+                # than asking Apple the same question every hour forever.
+                echo "::error::$ENGINE_ID $VERSION $PLATFORM was $STATUS by the notary service (submission $ID)"
+                xcrun notarytool log "$ID" \
+                  --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+                aws s3 rm "s3://$S3_BUCKET/$STAGE_BASE/$VERSION/$PLATFORM/" --recursive --endpoint-url "$S3_ENDPOINT"
+                REJECTED=$((REJECTED + 1))
+              else
+                echo "Still with Apple; leaving it staged."
+                WAITING=$((WAITING + 1))
+              fi
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Accepted. Compose release.json from what the release job recorded,
+            # so no value here is invented -- the digest in particular is the one
+            # taken of the archive that was signed and submitted.
+            jq '{version, platform, file, sha256, sizeBytes, command, args, instances}' pending.json > release.json
+            cat release.json
+
+            RELEASE="s3://$S3_BUCKET/$BASE/$VERSION/$PLATFORM"
+            # Server-side copy: the archive never travels through this runner, so
+            # it cannot be altered on the way.
+            aws s3 cp "s3://$S3_BUCKET/$STAGE_BASE/$VERSION/$PLATFORM/$ARCHIVE" "$RELEASE/$ARCHIVE" \
+              --endpoint-url "$S3_ENDPOINT" --content-type application/zip
+            aws s3 cp release.json "$RELEASE/release.json" \
+              --endpoint-url "$S3_ENDPOINT" --content-type application/json
+
+            # The catalogue is composed from these two objects, so a release is
+            # only real once both answer.
+            for check in "$BASE/$VERSION/$PLATFORM/$ARCHIVE" "$BASE/$VERSION/$PLATFORM/release.json"; do
+              if ! aws s3api head-object --bucket "$S3_BUCKET" --key "$check" \
+                   --endpoint-url "$S3_ENDPOINT" > /dev/null 2>&1; then
+                echo "::error::$check is missing after promotion"
+                exit 1
+              fi
+            done
+
+            # Superseded builds of THIS platform only -- same reasoning as the
+            # release job: a platform that has not published must not lose what
+            # it already had.
+            aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+              --prefix "$BASE/" --delimiter / \
+              --endpoint-url "$S3_ENDPOINT" --query 'CommonPrefixes[].Prefix' --output text \
+              | tr '\t' '\n' | tr -d '\r' \
+              | while read -r vprefix; do
+                  case "$vprefix" in
+                    "" | None | "$BASE/$VERSION/") continue ;;
+                  esac
+                  echo "Removing superseded ${vprefix}${PLATFORM}/"
+                  aws s3 rm "s3://$S3_BUCKET/${vprefix}${PLATFORM}/" --recursive --endpoint-url "$S3_ENDPOINT"
+                done
+
+            aws s3 rm "s3://$S3_BUCKET/$STAGE_BASE/$VERSION/$PLATFORM/" --recursive --endpoint-url "$S3_ENDPOINT"
+            echo "Published $ENGINE_ID $VERSION ($PLATFORM)"
+            PROMOTED=$((PROMOTED + 1))
+            echo "::endgroup::"
+          done
+
+          {
+            echo "### $ENGINE_ID"
+            echo
+            echo "- promoted: **$PROMOTED**"
+            echo "- still with Apple: $WAITING"
+            echo "- rejected: $REJECTED"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # A rejection is a failure worth a red run: something signed and proved
+          # locally was refused by Apple, and nobody would look otherwise.
+          if [ "$REJECTED" -gt 0 ]; then exit 1; fi

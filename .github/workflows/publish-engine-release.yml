@@ -37,6 +37,10 @@ env:
   S3_BUCKET: gammonbase-assets-prod
   # EngineCatalogueService composes the catalogue from exactly this prefix.
   ENGINES_PREFIX: engines
+  # Where a macOS build waits for Apple. Outside ENGINES_PREFIX on
+  # purpose: EngineCatalogueService composes the catalogue from that
+  # prefix alone, so nothing here can be offered before it is notarized.
+  STAGING_PREFIX: staging/engines
 
 jobs:
   publish:
@@ -304,83 +308,6 @@ jobs:
       # The two documents the site composes the catalogue from. The digest is
       # what lets an install be REFUSED; the command is what stops the client
       # guessing a path into the archive.
-      # macOS only. Gatekeeper refuses Developer-ID-signed software that the
-      # notary service has not seen, so this is not optional decoration.
-      #
-      # NOT STAPLED, deliberately and unavoidably: `stapler` attaches tickets to
-      # bundles, disk images and installer packages, and a plain Mach-O — which
-      # is exactly what this archive contains — cannot carry one. Notarizing the
-      # zip still registers each binary's cdhash with Apple, and Gatekeeper
-      # validates that over the network. The consequence is narrow and worth
-      # stating: a first launch on a Mac with no internet can be refused.
-      # Installing an engine requires downloading it, so that window is small —
-      # but it is real, and the alternative is reshaping the macOS archive into a
-      # .dmg and having one platform's layout differ from the other three.
-      #
-      # Notarization does not modify the file, so the digest computed above is
-      # still the digest of what gets published.
-      - name: Notarize the macOS archive
-        if: startsWith(matrix.platform, 'macos-')
-        env:
-          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-        run: |
-          KEY="$RUNNER_TEMP/AuthKey.p8"
-          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
-
-          # 2h, not 30m. The first submission from this Team ID sat at "In
-          # Progress" for the full thirty minutes the original value allowed
-          # (submission e2dfb804-6af0-478f-a568-f0718ff8ab42, 2026-07-31) --
-          # accepted, uploaded, valid, just slow. Apple's queue is unhurried for
-          # a new account and typically settles to minutes once it is warm.
-          # Both engine repositories are public, so macOS runner minutes are
-          # free here and a generous ceiling costs nothing. GitHub's own job
-          # limit is 6h, so this stays well inside it.
-          LOG="$RUNNER_TEMP/notary.txt"
-          xcrun notarytool submit "$ARCHIVE" \
-            --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
-            --wait --timeout 2h 2>&1 | tee "$LOG"
-
-          # notarytool's exit code is not a verdict: a submission can be
-          # processed successfully and still be Invalid. Read the status.
-          STATUS="$(grep -Eo '  status: [A-Za-z]+' "$LOG" | tail -1 | awk '{print $2}')"
-          if [ "$STATUS" != "Accepted" ]; then
-            echo "::error::notarization returned '$STATUS' for $ARCHIVE"
-            ID="$(grep -Eo '  id: [0-9a-f-]{36}' "$LOG" | head -1 | awk '{print $2}')"
-            # The submission SURVIVES this job. notarytool exiting -- on timeout
-            # or otherwise -- does not cancel anything; Apple keeps processing and
-            # may accept it hours later. Without the id written somewhere durable
-            # that acceptance is unreachable, because the log scrolls past and the
-            # runner is destroyed. Put it where a person will find it:
-            #
-            #   xcrun notarytool info <id> --key ... --key-id ... --issuer ...
-            #
-            # A submission that lands later can then be published by re-running
-            # this workflow, rather than the release being lost to a queue.
-            {
-              echo "### Notarization did not complete: ${{ matrix.platform }}"
-              echo
-              echo "- archive: \`$ARCHIVE\`"
-              echo "- status: **$STATUS**"
-              echo "- submission id: \`${ID:-unknown}\`"
-              echo
-              echo "Apple is still processing this. Check it with:"
-              echo '```'
-              echo "xcrun notarytool info ${ID:-<id>} --key AuthKey.p8 --key-id <key-id> --issuer <issuer>"
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
-            if [ -n "$ID" ]; then
-              echo "--- notary log ---"
-              xcrun notarytool log "$ID" \
-                --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
-            fi
-            rm -f "$KEY"
-            exit 1
-          fi
-          rm -f "$KEY"
-          echo "Notarized $ARCHIVE"
-
       - name: Write the manifests
         run: |
           cat > identity.json <<JSON
@@ -406,10 +333,83 @@ jobs:
           JSON
           cat identity.json release.json
 
+      # macOS does NOT publish here. It submits and walks away.
+      #
+      # Apple's notary queue is not something a job can wait out. gnubg's
+      # archives came back in 22 minutes; sage's ran past 80 on the same account,
+      # the same day, at a comparable size, and a first submission had already
+      # exceeded 30. Apple documents 24-72h for anything that trips extended
+      # review. A release tied to that queue is a release that can be lost to it:
+      # notarytool exits, the runner is destroyed, Apple accepts an hour later and
+      # there is nothing left to publish.
+      #
+      # So: submit without waiting, and stage the archive under a prefix the
+      # catalogue never reads, next to the submission id. complete-notarization.yml
+      # promotes it once Apple has answered. Twenty minutes and seventy-two hours
+      # are then the same case.
+      - name: Submit for notarization and stage (macOS)
+        if: startsWith(matrix.platform, 'macos-')
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
+          AWS_DEFAULT_REGION: fr-par
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+
+          LOG="$RUNNER_TEMP/notary.txt"
+          # No --wait. The submission is handed over and the job moves on.
+          xcrun notarytool submit "$ARCHIVE"             --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" 2>&1 | tee "$LOG"
+          rm -f "$KEY"
+
+          ID="$(grep -Eo '  id: [0-9a-f-]{36}' "$LOG" | head -1 | awk '{print $2}')"
+          if [ -z "$ID" ]; then
+            echo "::error::notarytool did not report a submission id; nothing was submitted"
+            exit 1
+          fi
+
+          # Everything the completion workflow needs to publish this without
+          # rebuilding it. The release.json fields are carried verbatim so the
+          # promotion step composes no values of its own.
+          cat > pending.json <<JSON
+          {
+            "submissionId": "$ID",
+            "engineId": "$ENGINE_ID",
+            "version": "$VERSION",
+            "platform": "${{ matrix.platform }}",
+            "file": "$ARCHIVE",
+            "sha256": "$SHA256",
+            "sizeBytes": $SIZE,
+            "command": "${{ matrix.exe }}",
+            "args": [],
+            "instances": 2,
+            "commit": "$GITHUB_SHA",
+            "submittedUtc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          JSON
+          cat pending.json
+
+          STAGE="s3://$S3_BUCKET/$STAGING_PREFIX/$ENGINE_ID/$VERSION/${{ matrix.platform }}"
+          aws s3 cp "$ARCHIVE" "$STAGE/$ARCHIVE" --endpoint-url "$S3_ENDPOINT" --content-type application/zip
+          aws s3 cp pending.json "$STAGE/pending.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
+
+          {
+            echo "### Submitted for notarization: ${{ matrix.platform }}"
+            echo
+            echo "- submission id: \`$ID\`"
+            echo "- staged at: \`$STAGING_PREFIX/$ENGINE_ID/$VERSION/${{ matrix.platform }}/\`"
+            echo
+            echo "Not published yet. Run **Complete notarization** once Apple has answered."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # The archive FIRST, then the manifest that publishes it: the catalogue is
       # composed from the manifests, so a release becomes visible only once the
       # thing it describes is actually downloadable.
       - name: Publish to object storage
+        if: "!startsWith(matrix.platform, 'macos-')"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
@@ -453,6 +453,7 @@ jobs:
       # success for deleting a nonexistent key, so the log reads "delete:" for
       # objects never touched.
       - name: Remove superseded builds for this platform
+        if: "!startsWith(matrix.platform, 'macos-')"
         env:
           # `--delimiter /` is a bare slash, and Git Bash on windows-latest
           # rewrites that to C:/Program Files/Git/ before aws ever sees it -- so
@@ -501,6 +502,7 @@ jobs:
       # existed. This is the only step that asks the question a user asks: can
       # the thing be downloaded?
       - name: Verify this platform's release survived
+        if: "!startsWith(matrix.platform, 'macos-')"
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
