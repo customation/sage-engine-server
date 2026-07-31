@@ -1,0 +1,144 @@
+name: Verify the macOS build
+
+# Answers one question, on hardware GitHub gives us for free: does Open Sage
+# build and evaluate correctly under Apple's toolchain?
+#
+# It publishes NOTHING. That is the whole reason it is a separate workflow
+# rather than two more rows in publish-engine-release.yml's matrix. A macOS
+# binary a user downloads is refused by Gatekeeper until it carries a Developer
+# ID signature and a notarization ticket, and the Apple Developer Program
+# enrolment for Customation AS is still pending verification. Rows added to the
+# release matrix today would upload macos-aarch64 and macos-x86_64 archives to
+# object storage, the site composes its catalogue from exactly those objects,
+# and GammonBase Desktop would start offering a download that cannot be opened.
+# Better to ask the build question now and add the publish rows in one piece
+# later, together with the sign-and-notarize step that makes them legitimate.
+#
+# Delete this file when publish-engine-release.yml grows its macOS rows. Until
+# then it is the only thing standing between "the Apple account arrived" and
+# discovering that gnubg's or bgsage's toolchain assumptions do not hold there.
+#
+# What is already true, and is what this exercises rather than establishes:
+#   * cpp/capi/CMakeLists.txt branches on CMAKE_SYSTEM_PROCESSOR matching
+#     arm64|aarch64 — which is what Apple Silicon reports — so it already takes
+#     the NEON path and already withholds -mavx2/-mfma. Same source as the
+#     linux-aarch64 job that has been green since 2026-07-30.
+#   * src/main.rs already resolves libbgsage_capi.dylib under target_os = macos,
+#     and loads it with libloading, i.e. a dlopen against a path derived from
+#     the executable's own location. There is no install_name or @rpath to get
+#     right, which is the usual way a first Mac build of something like this
+#     fails.
+#
+# So this is not expected to need source changes. It is expected to prove that,
+# and to say so loudly if it is wrong.
+
+on:
+  workflow_dispatch:
+
+env:
+  ENGINE_ID: sage
+
+jobs:
+  verify:
+    strategy:
+      # Neither architecture's result is worth withholding because the other
+      # failed — they use different compiler flags (NEON versus AVX2) and can
+      # fail independently.
+      fail-fast: false
+      matrix:
+        include:
+          # macos-latest is Apple Silicon: a 3-core M1 with 7 GB. This is the
+          # architecture that matters — every Mac sold since 2020 — and the one
+          # the desktop client calls macos-aarch64.
+          - os: macos-latest
+            platform: macos-aarch64
+            capi_built: build/libbgsage_capi.dylib
+          # Intel Macs are still in venues, and the runner label for them is now
+          # suffixed rather than versioned by OS: macos-15-intel, not macos-13.
+          # 4 cores, 14 GB.
+          - os: macos-15-intel
+            platform: macos-x86_64
+            capi_built: build/libbgsage_capi.dylib
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The gbase branch, NOT the default one — cpp/capi exists only there.
+      # Same reason the release workflow pins it; a checkout of main produces a
+      # tree with no capi to build.
+      - name: Check out the engine core
+        uses: actions/checkout@v4
+        with:
+          repository: customation/bgsage
+          ref: gbase
+          path: bgsage
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # CMake is preinstalled on GitHub's macOS images. The default generator
+      # here is Unix Makefiles, so the outputs land at build/<name> exactly as
+      # they do on the Linux runners — which is why capi_built reads the same
+      # apart from the extension.
+      - name: Build the engine core
+        run: |
+          cmake -S bgsage/cpp/capi -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release
+          test -f "${{ matrix.capi_built }}" || {
+            echo "::error::${{ matrix.capi_built }} was not produced"
+            exit 1
+          }
+          echo "Built for: $(lipo -archs "${{ matrix.capi_built }}")"
+
+      - name: Build the daemon
+        run: cargo build --release
+
+      # The layout the daemon resolves by default, relative to its own
+      # executable. Identical to the release workflow's staging step: testing a
+      # layout that is not the shipped one proves nothing about the shipped one.
+      - name: Assemble the release layout
+        run: |
+          STAGE="stage/$ENGINE_ID"
+          mkdir -p "$STAGE/models" "$STAGE/data"
+          cp target/release/sage-engine-server "$STAGE/"
+          cp "${{ matrix.capi_built }}" "$STAGE/libbgsage_capi.dylib"
+          cp bgsage/models/sl_s9_*.weights.best "$STAGE/models/"
+          cp bgsage/data/bearoff_1sided.db "$STAGE/data/"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+          echo "Staged:"; find "$STAGE" -type f | wc -l; du -sh "$STAGE"
+
+      # Two layers, because they fail in different places and a build that goes
+      # red should say which half is wrong.
+      #
+      # The C shim first: it links the dylib directly, so it fails if the C++
+      # miscompiled or if Mach-O linkage is wrong, without any Rust in the
+      # picture.
+      - name: Smoke-test the C shim
+        run: |
+          ./build/capi_smoke "$STAGE/models" "$STAGE/data/bearoff_1sided.db"
+
+      # Then the daemon over stdio, driven the way a host drives it. This is the
+      # test worth having: it asserts NUMBERS — start position win=0.5276,
+      # eq=+0.0819, cf=+0.1045, and best 3-1 = 8/5 6/5 at +0.2148 — to four
+      # decimals. So it does not merely prove the NEON path compiles on Apple
+      # Silicon; it proves it agrees with what every other platform computes.
+      # A silent numerical divergence on one architecture is exactly the failure
+      # that would otherwise reach a venue.
+      #
+      # Python is preinstalled on these images and is a CI referee only. It
+      # never ships, and nothing an end user installs requires it.
+      - name: Drive the daemon end to end
+        run: |
+          python3 tests/e2e/run_e2e.py \
+            "$STAGE/sage-engine-server" \
+            "$STAGE/libbgsage_capi.dylib" \
+            "$STAGE/models" \
+            "$STAGE/data/bearoff_1sided.db"
+
+      - name: Report
+        run: |
+          echo "Open Sage builds and evaluates correctly on ${{ matrix.platform }}."
+          echo "Unsigned — not published. Signing needs the Developer ID certificate."
