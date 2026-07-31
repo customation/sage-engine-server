@@ -348,6 +348,28 @@ jobs:
           if [ "$STATUS" != "Accepted" ]; then
             echo "::error::notarization returned '$STATUS' for $ARCHIVE"
             ID="$(grep -Eo '  id: [0-9a-f-]{36}' "$LOG" | head -1 | awk '{print $2}')"
+            # The submission SURVIVES this job. notarytool exiting -- on timeout
+            # or otherwise -- does not cancel anything; Apple keeps processing and
+            # may accept it hours later. Without the id written somewhere durable
+            # that acceptance is unreachable, because the log scrolls past and the
+            # runner is destroyed. Put it where a person will find it:
+            #
+            #   xcrun notarytool info <id> --key ... --key-id ... --issuer ...
+            #
+            # A submission that lands later can then be published by re-running
+            # this workflow, rather than the release being lost to a queue.
+            {
+              echo "### Notarization did not complete: ${{ matrix.platform }}"
+              echo
+              echo "- archive: \`$ARCHIVE\`"
+              echo "- status: **$STATUS**"
+              echo "- submission id: \`${ID:-unknown}\`"
+              echo
+              echo "Apple is still processing this. Check it with:"
+              echo '```'
+              echo "xcrun notarytool info ${ID:-<id>} --key AuthKey.p8 --key-id <key-id> --issuer <issuer>"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
             if [ -n "$ID" ]; then
               echo "--- notary log ---"
               xcrun notarytool log "$ID" \
