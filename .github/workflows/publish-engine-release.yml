@@ -250,3 +250,90 @@ jobs:
           aws s3 cp release.json "$RELEASE/release.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
           aws s3 cp identity.json "$BASE/identity.json" --endpoint-url "$S3_ENDPOINT" --content-type application/json
           echo "Published $ENGINE_ID $VERSION (${{ matrix.platform }})"
+
+      # A new version supersedes the old one. Anything left behind is an
+      # unreachable copy that still costs storage, still appears to anyone
+      # listing the bucket, and -- the reason this matters -- is still
+      # DOWNLOADABLE. A superseded build is often superseded precisely because
+      # it was wrong.
+      #
+      # Scoped to THIS PLATFORM, which is the whole design. Jobs here are
+      # fail-fast: false and publish independently, so a blanket "delete every
+      # other version" would let a successful windows job delete the last
+      # working linux-aarch64 build at the moment aarch64 failed its gate --
+      # turning one platform's bad release into another platform's outage.
+      # Deleting only engines/<id>/<version>/<platform>/ means a platform that
+      # never got here never loses what it already had.
+      #
+      # identity.json cannot be caught by this: it sits at
+      # engines/<id>/identity.json, and listing with a delimiter returns
+      # CommonPrefixes -- directories only -- so a key at that level is not in
+      # the result set at all. Written so it cannot see the file, rather than
+      # seeing it and being careful.
+      #
+      # `tr -d '\r'` is not decoration. This job runs on windows-latest too, the
+      # keys arrive with carriage returns, and a key ending in one matches no
+      # guard and names no object -- so every guard silently fails open while
+      # every delete silently targets a key that does not exist. S3 reports
+      # success for deleting a nonexistent key, so the log reads "delete:" for
+      # objects never touched.
+      - name: Remove superseded builds for this platform
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
+          AWS_DEFAULT_REGION: fr-par
+        run: |
+          BASE="$ENGINES_PREFIX/$ENGINE_ID"
+          PLATFORM="${{ matrix.platform }}"
+
+          # 1. Stale files beside this release -- an earlier build of the same
+          #    version published under a different archive name.
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+            --prefix "$BASE/$VERSION/$PLATFORM/" \
+            --endpoint-url "$S3_ENDPOINT" --query 'Contents[].Key' --output text \
+            | tr '\t' '\n' | tr -d '\r' \
+            | while read -r key; do
+                case "$key" in
+                  "" | None) continue ;;
+                  "$BASE/$VERSION/$PLATFORM/$ARCHIVE" | "$BASE/$VERSION/$PLATFORM/release.json") continue ;;
+                esac
+                echo "Removing stale $key"
+                aws s3 rm "s3://$S3_BUCKET/$key" --endpoint-url "$S3_ENDPOINT"
+              done
+
+          # 2. This platform's directory under every OTHER version.
+          aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+            --prefix "$BASE/" --delimiter / \
+            --endpoint-url "$S3_ENDPOINT" --query 'CommonPrefixes[].Prefix' --output text \
+            | tr '\t' '\n' | tr -d '\r' \
+            | while read -r vprefix; do
+                case "$vprefix" in
+                  "" | None | "$BASE/$VERSION/") continue ;;
+                esac
+                echo "Removing superseded ${vprefix}${PLATFORM}/"
+                aws s3 rm "s3://$S3_BUCKET/${vprefix}${PLATFORM}/" --recursive --endpoint-url "$S3_ENDPOINT"
+              done
+
+      # A release is published only if what the catalogue is composed from is
+      # still there when the job ends. Every step above reports success on its
+      # own terms, including a delete that "worked" against a key that never
+      # existed. This is the only step that asks the question a user asks: can
+      # the thing be downloaded?
+      - name: Verify this platform's release survived
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.SCW_OBJECT_STORAGE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.SCW_OBJECT_STORAGE_SECRET_KEY }}
+          AWS_DEFAULT_REGION: fr-par
+        run: |
+          BASE="$ENGINES_PREFIX/$ENGINE_ID"
+          PLATFORM="${{ matrix.platform }}"
+          for key in "$BASE/identity.json" \
+                     "$BASE/$VERSION/$PLATFORM/release.json" \
+                     "$BASE/$VERSION/$PLATFORM/$ARCHIVE"; do
+            if ! aws s3api head-object --bucket "$S3_BUCKET" --key "$key" \
+                 --endpoint-url "$S3_ENDPOINT" > /dev/null 2>&1; then
+              echo "::error::$key is missing after publishing -- the catalogue would offer a file that is not there"
+              exit 1
+            fi
+            echo "present: $key"
+          done
