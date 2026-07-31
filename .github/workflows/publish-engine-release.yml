@@ -69,7 +69,32 @@ jobs:
             exe: sage-engine-server
             capi: libbgsage_capi.so
             capi_built: build/libbgsage_capi.so
+          # macOS. Proven by verify-macos-build.yml before these rows existed:
+          # both architectures compile and pass the full e2e, including the
+          # numeric parity the NEON sigmoid fix bought.
+          #
+          # Nothing needs bundling alongside. cpp/capi links Threads::Threads and
+          # libc++ and nothing else, both of which are part of the system on
+          # macOS — unlike gnubg, whose library pulls in Homebrew's glib, gettext
+          # and gmp by absolute path and cannot ship until those travel with it.
+          - os: macos-latest
+            platform: macos-aarch64
+            exe: sage-engine-server
+            capi: libbgsage_capi.dylib
+            capi_built: build/libbgsage_capi.dylib
+          - os: macos-15-intel
+            platform: macos-x86_64
+            exe: sage-engine-server
+            capi: libbgsage_capi.dylib
+            capi_built: build/libbgsage_capi.dylib
     runs-on: ${{ matrix.os }}
+    # The Apple signing credentials are secrets of this environment rather than
+    # of the repository, so they can only be read from main or a v* tag. This
+    # repository is PUBLIC: a repository-level signing secret would be readable
+    # by any workflow on any branch a collaborator can push. Losing a signing
+    # credential is not a rotation — it is a revoked certificate and malware
+    # signed in our name.
+    environment: release
     defaults:
       run:
         # Git Bash on the Windows runner, so one script serves both platforms.
@@ -165,6 +190,79 @@ jobs:
       # only; nothing a user installs requires it. Which name it answers to
       # differs, hence the probe: Git Bash on windows-latest has `python` but
       # not always `python3`.
+      # macOS only. Signing happens BEFORE the e2e below, so what gets exercised
+      # is the artefact that ships, Hardened Runtime and all — not an unsigned
+      # near-copy of it.
+      #
+      # Every Mach-O is signed, not just the executable: a signed daemon next to
+      # an unsigned library is not a signed product, and on Apple Silicon
+      # unsigned code does not run at all.
+      #
+      # Unlike SSL.com's eSigner on the Windows side, there is no cloud HSM for
+      # Developer ID — the private key genuinely lands on the runner. It goes
+      # into a keychain created for this job and destroyed with it, and the
+      # decoded .p12 is removed as soon as it is imported.
+      - name: Sign for macOS
+        if: startsWith(matrix.platform, 'macos-')
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          # The value the Apple secrets held between being created and the
+          # certificate existing. A placeholder that merely LOOKS configured is
+          # worse than no value: "is it set" passes, and the run spends ten
+          # minutes building before dying at an unhelpful signing error. This
+          # check knows the string by name. Keep it — secrets get recreated.
+          APPLE_PLACEHOLDER: PLACEHOLDER-SET-FROM-THE-APPLE-DEVELOPER-ACCOUNT
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY KEYCHAIN_PASSWORD; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              echo "::error::$name is not set on the 'release' environment."
+              exit 1
+            fi
+            if [ "$value" = "$APPLE_PLACEHOLDER" ]; then
+              echo "::error::$name is still the placeholder — the Apple credentials were never filled in."
+              exit 1
+            fi
+          done
+
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          CERT="$RUNNER_TEMP/certificate.p12"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERT"
+          security import "$CERT" -P "$APPLE_CERTIFICATE_PASSWORD" -k "$KEYCHAIN" \
+            -T /usr/bin/codesign -f pkcs12
+          rm -f "$CERT"
+
+          # Without this, codesign blocks on a GUI prompt for keychain access
+          # that nobody can answer, and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          # Search order, not replacement: the system keychain still has to be
+          # reachable for the Apple intermediates.
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          STAGE="stage/$ENGINE_ID"
+          for file in "$STAGE/${{ matrix.exe }}" "$STAGE/${{ matrix.capi }}"; do
+            echo "Signing $file"
+            # --options runtime is Hardened Runtime, which notarization requires.
+            # --timestamp is a secure timestamp, also required: without it the
+            # signature stops verifying the day the certificate expires.
+            codesign --force --options runtime --timestamp \
+              --sign "$APPLE_SIGNING_IDENTITY" "$file"
+          done
+
+          # The exit code of codesign is not the answer to "is it signed".
+          for file in "$STAGE/${{ matrix.exe }}" "$STAGE/${{ matrix.capi }}"; do
+            codesign --verify --strict --verbose=2 "$file"
+            codesign --display --verbose=2 "$file" 2>&1 | grep -E "Authority|Timestamp|flags" || true
+          done
+
       - name: Prove the staged release evaluates correctly
         run: |
           PY=python3
@@ -206,6 +304,53 @@ jobs:
       # The two documents the site composes the catalogue from. The digest is
       # what lets an install be REFUSED; the command is what stops the client
       # guessing a path into the archive.
+      # macOS only. Gatekeeper refuses Developer-ID-signed software that the
+      # notary service has not seen, so this is not optional decoration.
+      #
+      # NOT STAPLED, deliberately and unavoidably: `stapler` attaches tickets to
+      # bundles, disk images and installer packages, and a plain Mach-O — which
+      # is exactly what this archive contains — cannot carry one. Notarizing the
+      # zip still registers each binary's cdhash with Apple, and Gatekeeper
+      # validates that over the network. The consequence is narrow and worth
+      # stating: a first launch on a Mac with no internet can be refused.
+      # Installing an engine requires downloading it, so that window is small —
+      # but it is real, and the alternative is reshaping the macOS archive into a
+      # .dmg and having one platform's layout differ from the other three.
+      #
+      # Notarization does not modify the file, so the digest computed above is
+      # still the digest of what gets published.
+      - name: Notarize the macOS archive
+        if: startsWith(matrix.platform, 'macos-')
+        env:
+          APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          KEY="$RUNNER_TEMP/AuthKey.p8"
+          printf '%s' "$APPLE_API_KEY_P8" | base64 --decode > "$KEY"
+
+          LOG="$RUNNER_TEMP/notary.txt"
+          xcrun notarytool submit "$ARCHIVE" \
+            --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" \
+            --wait --timeout 30m 2>&1 | tee "$LOG"
+
+          # notarytool's exit code is not a verdict: a submission can be
+          # processed successfully and still be Invalid. Read the status.
+          STATUS="$(grep -Eo '  status: [A-Za-z]+' "$LOG" | tail -1 | awk '{print $2}')"
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::notarization returned '$STATUS' for $ARCHIVE"
+            ID="$(grep -Eo '  id: [0-9a-f-]{36}' "$LOG" | head -1 | awk '{print $2}')"
+            if [ -n "$ID" ]; then
+              echo "--- notary log ---"
+              xcrun notarytool log "$ID" \
+                --key "$KEY" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER" || true
+            fi
+            rm -f "$KEY"
+            exit 1
+          fi
+          rm -f "$KEY"
+          echo "Notarized $ARCHIVE"
+
       - name: Write the manifests
         run: |
           cat > identity.json <<JSON
