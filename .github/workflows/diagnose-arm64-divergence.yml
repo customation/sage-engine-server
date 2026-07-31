@@ -75,7 +75,13 @@ jobs:
 
       - name: Measure every flag variant
         run: |
-          set -uo pipefail
+          # -e stays ON. GitHub runs this as `bash -e -o pipefail`, and the
+          # first version of this file tried to opt out with `set -uo pipefail`
+          # -- which does not clear -e, so the step died on the first variant
+          # the instant the e2e reported a parity miss. That miss IS the
+          # measurement. -e is suspended around that one command below and
+          # nowhere else, so a build that genuinely breaks still stops the run.
+          set -u
 
           CMAKELISTS=bgsage/cpp/capi/CMakeLists.txt
           cp "$CMAKELISTS" /tmp/CMakeLists.pristine
@@ -113,19 +119,28 @@ jobs:
 
             rm -rf build
             cmake -S bgsage/cpp/capi -B build -DCMAKE_BUILD_TYPE=Release > /dev/null
-            cmake --build build --config Release > /dev/null 2>&1
+            # Quiet while it works, loud when it does not. A variant that fails
+            # to compile is a real answer -- "clang rejects this flag on arm64"
+            # -- but only if the reason survives to the log.
+            if ! cmake --build build --config Release > /tmp/build.log 2>&1; then
+              echo "::error::variant '$NAME' failed to compile"
+              cat /tmp/build.log
+              exit 1
+            fi
             cp "build/$LIBNAME" "stage/$LIBNAME"
 
             # The e2e exits non-zero on a parity miss, which is the point -- but
             # here its NUMBER is the measurement, so the exit code is recorded
             # rather than obeyed. Nothing is being swallowed: both the status
             # and the value go into the table below.
+            set +e
             OUT="$(python3 tests/e2e/run_e2e.py \
                     "stage/sage-engine-server" \
                     "stage/$LIBNAME" \
                     "stage/models" \
                     "stage/data/bearoff_1sided.db" 2>&1)"
             STATUS=$?
+            set -e
             echo "$OUT"
             echo "::endgroup::"
 
