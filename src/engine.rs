@@ -12,7 +12,9 @@ use std::ffi::{c_int, c_void, CString};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use bep_protocol::contract::{kinds, Conventions, Describe, EngineIdentity, Level, RolloutParams};
+use bep_protocol::contract::{
+    kinds, methods, Conventions, Describe, EngineIdentity, Level, RolloutParams,
+};
 use bep_protocol::gnubg_ids::{Board, CubeOwner, MatchContext};
 use serde::Deserialize;
 
@@ -41,6 +43,29 @@ pub mod levels {
     pub const ROLLER_2T: &str = "2T";
     pub const ROLLER_3T: &str = "3T";
     pub const ROLLOUT: &str = "rollout";
+}
+
+/// Ply-parity rule for the cube, XG counting. A cube decision is only
+/// sound when the search leaves the ROOT player on roll at the leaves,
+/// i.e. when each player has been evaluated an equal number of times;
+/// otherwise the on-roll bonus lands on one side and skews the
+/// win/gammon/backgammon split the cube action is computed from.
+///
+/// Which advertised plies satisfy that is a counting convention, not a
+/// difference in the maths. bgsage counts the XG way (1-ply = raw NN),
+/// so the balanced depths are the ODD ones — 1 and 3. gnubg counts from
+/// 0 and lands on the even ones; `gnubg-engine-server` carries the
+/// mirror image of this function. 3-ply is therefore sage's deep-cube
+/// level, and 2-ply and 4-ply answer checker questions only.
+fn ply_methods(depth: u32) -> Option<&'static [&'static str]> {
+    match depth {
+        2 | 4 => Some(&[
+            methods::EVALUATE_POSITION,
+            methods::EVALUATE_MOVES,
+            methods::ANALYZE_MOVE,
+        ]),
+        _ => None,
+    }
 }
 
 pub const STRATEGY_BACKGAME_PAIR: &str = "backgame_pair";
@@ -146,6 +171,10 @@ pub enum LevelError {
     /// levelOptions supplied for a level that is not configurable, or
     /// options that don't deserialize.
     InvalidOptions(String),
+    /// A method this level does not answer — see `ply_methods`. Refused
+    /// rather than answered: a wrong-parity cube equity looks entirely
+    /// plausible, so returning one would be worse than returning nothing.
+    MethodNotSupported { level: String, method: String },
 }
 
 impl std::fmt::Display for LevelError {
@@ -153,6 +182,10 @@ impl std::fmt::Display for LevelError {
         match self {
             LevelError::UnknownLevel(level) => write!(f, "unknown level {level:?}"),
             LevelError::InvalidOptions(message) => write!(f, "invalid levelOptions: {message}"),
+            LevelError::MethodNotSupported { level, method } => write!(
+                f,
+                "level {level:?} does not answer {method} (see describe.levels[].methods)"
+            ),
         }
     }
 }
@@ -387,8 +420,10 @@ impl EnginePool {
     pub fn get(
         &self,
         level_id: &str,
+        method: &str,
         options: Option<&serde_json::Value>,
     ) -> Result<Arc<EngineHandle>, EngineGetError> {
+        self.check_method(level_id, method).map_err(EngineGetError::Level)?;
         let rollout_options = self.parse_options(level_id, options)?;
         let cache_key = match &rollout_options {
             Some(opts) => format!("{level_id}?{}", opts.cache_key()),
@@ -405,6 +440,26 @@ impl EnginePool {
         let handle = Arc::new(self.construct(level_id, rollout_options.as_ref())?);
         handles.insert(cache_key, Arc::clone(&handle));
         Ok(handle)
+    }
+
+    /// Ply levels answer only what `ply_methods` allows; roller and rollout
+    /// levels answer everything. An unknown level falls through so that
+    /// `construct` still reports it as unknown rather than as unsupported.
+    fn check_method(&self, level_id: &str, method: &str) -> Result<(), LevelError> {
+        let depth = match level_id {
+            levels::PLY_1 => 1,
+            levels::PLY_2 => 2,
+            levels::PLY_3 => 3,
+            levels::PLY_4 => 4,
+            _ => return Ok(()),
+        };
+        match ply_methods(depth) {
+            Some(allowed) if !allowed.contains(&method) => Err(LevelError::MethodNotSupported {
+                level: level_id.to_string(),
+                method: method.to_string(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     fn parse_options(
@@ -533,7 +588,7 @@ fn ply_level(id: &str, depth: u32) -> Level {
         display_name: None,
         ply_depth: Some(depth),
         rollout: None,
-        methods: None,
+        methods: ply_methods(depth).map(|m| m.iter().map(|s| s.to_string()).collect()),
         configurable: false,
         supports_progress: false,
         supports_cancel: false,

@@ -137,6 +137,13 @@ def level_for(plies: int) -> str:
     return f"{plies}ply"
 
 
+# A cube decision is only sound when both players have been evaluated an
+# equal number of times, which in XG counting (1-ply = raw NN) lands on the
+# ODD plies. sage-engine-server refuses evaluateCube on 2ply and 4ply, so a
+# cube comparison at those depths tests a number no caller can obtain.
+CUBE_PLIES = 3
+
+
 POSITIONS = [
     ("start", START_POSITION_ID),
     ("holding", encode_position_id(HOLDING_BOARD)),
@@ -165,9 +172,10 @@ def test_position_parity(referee, daemon, name, position_id, plies):
 @pytest.mark.parametrize("name,position_id", POSITIONS)
 def test_cube_parity(referee, daemon, name, position_id):
     event = referee.evaluate_cube(command(
-        contracts.EvaluateCube, TEMPLATE, GnubgPositionId=position_id, Plies=2))
+        contracts.EvaluateCube, TEMPLATE, GnubgPositionId=position_id, Plies=CUBE_PLIES))
     result = daemon.request("evaluateCube", {
-        "positionId": position_id, "matchId": MONEY_MATCH_ID, "level": level_for(2)})["result"]
+        "positionId": position_id, "matchId": MONEY_MATCH_ID,
+        "level": level_for(CUBE_PLIES)})["result"]
     # Equities compare FIRST so an action mismatch still shows which
     # numbers moved it.
     near(result["NoDoubleEquity"], event.no_double_equity, TOL_NPLY, "NoDoubleEquity")
@@ -237,9 +245,10 @@ def test_analyze_move_parity(referee, daemon):
 def test_match_play_parity(referee, daemon):
     match_id = match_play_id()
     event = referee.evaluate_cube(command(
-        contracts.EvaluateCube, TEMPLATE, GnubgMatchId=match_id, Plies=2))
+        contracts.EvaluateCube, TEMPLATE, GnubgMatchId=match_id, Plies=CUBE_PLIES))
     result = daemon.request("evaluateCube", {
-        "positionId": START_POSITION_ID, "matchId": match_id, "level": level_for(2)})["result"]
+        "positionId": START_POSITION_ID, "matchId": match_id,
+        "level": level_for(CUBE_PLIES)})["result"]
     assert result["RecommendedAction"] == event.recommended_action
     near(result["NoDoubleEquity"], event.no_double_equity, TOL_NPLY)
     near(result["TakeEquity"], event.take_equity, TOL_NPLY)
