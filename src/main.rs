@@ -361,7 +361,7 @@ fn evaluate(
     };
     let cube = cube_ctx(&context);
 
-    let handle = match pool.get(&params.level, method, params.level_options.as_ref()) {
+    let handle = match pool.get(&params.level, params.level_options.as_ref()) {
         Ok(handle) => handle,
         Err(EngineGetError::Level(LevelError::UnknownLevel(level))) => {
             return jsonrpc::error(
@@ -372,9 +372,6 @@ fn evaluate(
         }
         Err(EngineGetError::Level(LevelError::InvalidOptions(message))) => {
             return jsonrpc::error(Some(id), codes::INVALID_PARAMS, &message)
-        }
-        Err(EngineGetError::Level(e @ LevelError::MethodNotSupported { .. })) => {
-            return jsonrpc::error(Some(id), codes::INVALID_PARAMS, &e.to_string())
         }
         Err(EngineGetError::Create(e)) => {
             return jsonrpc::error(Some(id), error_codes::EVALUATION_FAILED, &e.to_string())
