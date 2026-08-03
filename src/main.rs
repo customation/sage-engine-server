@@ -32,6 +32,10 @@ use ffi::Capi;
 use mapping::MappingError;
 
 const ENV_CAPI_LIB: &str = "BGSAGE_CAPI_LIB";
+/// Set to anything but 0/false/empty to log one line per request. The same
+/// variable name works on gnubg-engine-server, so turning on engine logging
+/// does not mean remembering which engine you are debugging.
+const ENV_LOG_REQUESTS: &str = "BEP_LOG_REQUESTS";
 
 const FLAG_CAPI_LIB: &str = "--capi-lib";
 const FLAG_WEIGHTS_DIR: &str = "--weights-dir";
@@ -413,6 +417,26 @@ fn evaluate(
     };
     let progress = progress_context.as_ref();
 
+    // One line in, one line out, on stderr — stdout is the JSON-RPC channel.
+    //
+    // The settings logged are the handle's RESOLVED ones, not the request's.
+    // That distinction is the whole point: a levelOptions field dropped
+    // anywhere between JSON and the engine is otherwise invisible, and the
+    // only symptom is a number that looks plausible or a wait that looks
+    // like the engine being slow.
+    let log_requests = request_logging_enabled();
+    let started = std::time::Instant::now();
+    if log_requests {
+        let dice = match (params.die1, params.die2) {
+            (Some(die1), Some(die2)) => format!(" Die={die1},{die2}"),
+            _ => String::new(),
+        };
+        eprintln!(
+            "Recv {method} Level={} {}{dice} Pos={} Match={}",
+            params.level, handle.config_summary, params.position_id, params.match_id
+        );
+    }
+
     let result: Result<Value, MappingError> = match method {
         methods::EVALUATE_POSITION => {
             mapping::evaluate_position(&handle, &board, &cube, &params.position_id)
@@ -462,6 +486,17 @@ fn evaluate(
         }
     };
 
+    if log_requests {
+        let outcome = match &result {
+            Ok(_) => "ok".to_string(),
+            Err(MappingError::Engine(e)) if e.is_cancelled() => "cancelled".to_string(),
+            Err(MappingError::Engine(e)) => format!("FAILED {e}"),
+            Err(MappingError::Id(e)) => format!("FAILED {e}"),
+            Err(MappingError::Invalid(m)) | Err(MappingError::Failed(m)) => format!("FAILED {m}"),
+        };
+        eprintln!("Done {method} Level={} {outcome} in {} ms", params.level, started.elapsed().as_millis());
+    }
+
     match result {
         Ok(value) => jsonrpc::success(id, value),
         Err(MappingError::Engine(e)) if e.is_cancelled() => {
@@ -477,6 +512,20 @@ fn evaluate(
         Err(MappingError::Failed(message)) => {
             jsonrpc::error(Some(id), error_codes::EVALUATION_FAILED, &message)
         }
+    }
+}
+
+/// Per-request logging is opt-in because the desktop host runs a POOL of
+/// these daemons — a 36-roll dice-distribution pass across eight instances
+/// is 288 lines nobody asked for. Off by default, on when you are asking
+/// what the engine actually did.
+fn request_logging_enabled() -> bool {
+    match std::env::var(ENV_LOG_REQUESTS) {
+        Ok(value) => {
+            let value = value.trim();
+            !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+        }
+        Err(_) => false,
     }
 }
 

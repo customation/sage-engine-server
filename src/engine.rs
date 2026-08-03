@@ -255,6 +255,12 @@ pub struct EngineHandle {
     call_lock: Mutex<()>,
     pub supports_cancel: bool,
     pub plies_stamp: i32,
+    /// What this handle actually resolved to, formatted where the values
+    /// were decided rather than re-derived at the log site. Requested and
+    /// effective settings are exactly the pair that can silently diverge,
+    /// so logging anything re-computed from the request would defeat the
+    /// purpose.
+    pub config_summary: String,
 }
 
 // SAFETY: the raw pointer is only dereferenced under call_lock (except
@@ -516,6 +522,22 @@ impl EnginePool {
             threads: self.threads,
         };
 
+        // 0 is the capi's "pick for me", so say that rather than print a
+        // thread count of zero that no reader would believe.
+        let threads = if self.threads == 0 {
+            "auto".to_string()
+        } else {
+            self.threads.to_string()
+        };
+        let config_summary = if kind == KIND_ROLLOUT {
+            format!(
+                "Trials={} Trunc={} Decision={}ply Cube={}ply Threads={threads}",
+                rollout.n_trials, rollout.truncation_depth, rollout.decision_ply, rollout.cube.ply,
+            )
+        } else {
+            format!("Plies={n_plies} Threads={threads}")
+        };
+
         let ptr = unsafe { self.capi.engine_create(&config) }.map_err(EngineGetError::Create)?;
         Ok(EngineHandle {
             capi: Arc::clone(&self.capi),
@@ -523,6 +545,7 @@ impl EnginePool {
             call_lock: Mutex::new(()),
             supports_cancel,
             plies_stamp: plies_stamp(level_id),
+            config_summary,
         })
     }
 }
