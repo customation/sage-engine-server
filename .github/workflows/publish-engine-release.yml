@@ -44,6 +44,14 @@ env:
 
 jobs:
   publish:
+    # actions:write is for the "Start the notarization poller" step below, and
+    # has to be spelled out — the default GITHUB_TOKEN is read-only, so the enable
+    # would 403 at the end of an otherwise successful release. contents:read
+    # covers the checkout. Everything else here authenticates to Apple and
+    # Scaleway with their own secrets, not this token.
+    permissions:
+      actions: write
+      contents: read
     strategy:
       # One job per published platform, and NOT fail-fast: a broken Linux build
       # should not withdraw a working Windows release.
@@ -402,8 +410,21 @@ jobs:
             echo "- submission id: \`$ID\`"
             echo "- staged at: \`$STAGING_PREFIX/$ENGINE_ID/$VERSION/${{ matrix.platform }}/\`"
             echo
-            echo "Not published yet. Run **Complete notarization** once Apple has answered."
+            echo "Not published yet. **Complete notarization** now polls hourly and"
+            echo "will publish it, then switch itself off again."
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Strictly after staging: the poller must never wake to an empty bucket and
+      # conclude there is nothing to wait for. Idempotent, so each macOS platform
+      # in the matrix can run it without coordinating.
+      - name: Start the notarization poller
+        if: startsWith(matrix.platform, 'macos-')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # NOT `|| true`. If this fails the archive sits in staging with nothing
+        # coming to publish it — a release that silently never lands. Better a
+        # red release job that says so while the submission id is still on screen.
+        run: gh workflow enable complete-notarization.yml --repo "$GITHUB_REPOSITORY"
 
       # The archive FIRST, then the manifest that publishes it: the catalogue is
       # composed from the manifests, so a release becomes visible only once the

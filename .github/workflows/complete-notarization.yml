@@ -20,13 +20,29 @@ name: Complete notarization
 #
 # Runs on macOS because notarytool is macOS-only. The repository is public, so
 # the runner minutes are free.
+#
+# ── This workflow is OFF unless a submission is in flight ────────────────────
+# The release job enables it after staging; the last step here disables it again
+# the moment nothing is left waiting. So it exists for the hours between "sent to
+# Apple" and "published", and not for the other fifty-one weeks of the year.
+#
+# It used to stand on the hourly cron permanently, and the cost was not runner
+# minutes — those are free — it was that a job firing ~10x a day gives GitHub's
+# infrastructure ~10 chances a day to fail and mail somebody about a system
+# nobody touched. That is exactly what happened on 2026-08-06: two runs were
+# cancelled with "The job was not acquired by Runner of type hosted", i.e. the
+# free macOS pool had no machine to give, and the resulting red-run mail read
+# like a release had gone wrong. Nothing had run at all.
+#
+# Disabled means disabled: `workflow_dispatch` will not start it either. To run
+# it by hand, `gh workflow enable complete-notarization.yml` first.
 
 on:
   workflow_dispatch:
   schedule:
-    # Hourly. Fast enough that a normal submission is published within the hour,
-    # slow enough that a 72-hour review does not cost 144 runs. Does nothing at
-    # all when there is nothing staged.
+    # Hourly, but only while enabled. Fast enough that a normal submission is
+    # published within the hour, slow enough that a 72-hour extended review does
+    # not cost 144 runs.
     - cron: '17 * * * *'
 
 env:
@@ -40,6 +56,12 @@ jobs:
   promote:
     runs-on: macos-latest
     environment: release
+    # actions:write is what lets the last step switch this workflow off. Spelled
+    # out rather than inherited, because naming a permissions block makes it
+    # exhaustive — anything not listed is dropped, which is the point.
+    permissions:
+      actions: write
+      contents: read
     defaults:
       run:
         shell: bash
@@ -47,6 +69,7 @@ jobs:
     steps:
       - name: Promote everything Apple has accepted
         env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_API_KEY_P8: ${{ secrets.APPLE_API_KEY_P8 }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
@@ -69,9 +92,36 @@ jobs:
             --endpoint-url "$S3_ENDPOINT" --query 'Contents[].Key' --output text \
             | tr '\t' '\n' | tr -d '\r' | grep '/pending.json$' || true)"
 
+          # Defined here so both exits — nothing staged, and nothing left after
+          # promoting — turn the schedule off the same way. Re-lists the prefix
+          # first: a release job could have staged something while this run was
+          # working, and switching off in front of it would strand the archive
+          # with nothing left to publish it.
+          stand_down() {
+            LEFT="$(aws s3api list-objects-v2 --bucket "$S3_BUCKET" \
+              --prefix "$STAGE_BASE/" \
+              --endpoint-url "$S3_ENDPOINT" --query 'Contents[].Key' --output text \
+              | tr '\t' '\n' | tr -d '\r' | grep '/pending.json$' || true)"
+            if [ -n "$LEFT" ]; then
+              echo "Something is still staged; staying enabled."
+              return 0
+            fi
+            echo "Nothing left awaiting Apple — disabling the schedule."
+            # Checked explicitly, because this script runs under `set -u` alone:
+            # a bare failing command would be ignored and the run would stay
+            # green while the hourly job kept polling an empty bucket forever —
+            # which is the entire defect being fixed here.
+            if ! gh workflow disable complete-notarization.yml --repo "$GITHUB_REPOSITORY"; then
+              echo "::error::could not disable the schedule; it will keep polling hourly until someone runs 'gh workflow disable complete-notarization.yml --repo $GITHUB_REPOSITORY'"
+              exit 1
+            fi
+            echo "_Schedule disabled; the next release re-enables it._" >> "$GITHUB_STEP_SUMMARY"
+          }
+
           if [ -z "$PENDING" ]; then
             echo "Nothing staged for $ENGINE_ID."
             echo "### $ENGINE_ID: nothing awaiting notarization" >> "$GITHUB_STEP_SUMMARY"
+            stand_down
             exit 0
           fi
 
@@ -167,6 +217,12 @@ jobs:
             echo "- still with Apple: $WAITING"
             echo "- rejected: $REJECTED"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          # Switch off as soon as the last submission has resolved, rather than
+          # waiting for the next run to notice an empty bucket. A rejection
+          # resolves it too — the entry was cleared above, so there is nothing
+          # left to poll for even though the run is about to go red.
+          stand_down
 
           # A rejection is a failure worth a red run: something signed and proved
           # locally was refused by Apple, and nobody would look otherwise.
